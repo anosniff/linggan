@@ -247,8 +247,9 @@ const te = new TextEncoder(), td = new TextDecoder();
 const hasSubtle = !!(globalThis.crypto && crypto.subtle);
 const PW_KEY = "linggan_lib_pw_v1";
 const SES_KEY = "linggan_lib_session_v1";
-let cryptoKey = null;                 // 当前会话的 AES 密钥（仅内存）
+let sessionPw = null;                 // 当前会话的密码（仅内存，用于解密）
 let hasPw = !!localStorage.getItem(PW_KEY);
+let dataEncExists = false;            // 仓库中是否已有加密数据（决定“登录”还是“设置密码”）
 function b64enc(buf){ let s=""; const b=new Uint8Array(buf); for(let i=0;i<b.length;i++) s+=String.fromCharCode(b[i]); return btoa(s); }
 function b64dec(s){ const bin=atob(s); const b=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) b[i]=bin.charCodeAt(i); return b; }
 function rndBytes(n){ return crypto.getRandomValues(new Uint8Array(n)); }
@@ -261,14 +262,37 @@ async function deriveKey(pw, saltBytes){
   const m = await crypto.subtle.importKey("raw", te.encode(pw), "PBKDF2", false, ["deriveKey"]);
   return crypto.subtle.deriveKey({name:"PBKDF2", salt: saltBytes, iterations: 150000, hash: "SHA-256"}, m, {name:"AES-GCM", length: 256}, false, ["encrypt","decrypt"]);
 }
-async function encObj(obj, key){
+/* 加密包携带盐值（v2），任何设备都能用密码派生密钥解密 */
+async function encryptWith(obj, pw, saltBytes){
+  const key = await deriveKey(pw, saltBytes);
   const iv = rndBytes(12);
-  const ct = await crypto.subtle.encrypt({name:"AES-GCM", iv: iv}, key || cryptoKey, te.encode(JSON.stringify(obj)));
-  return {v:1, iv: b64enc(iv), data: b64enc(ct)};
+  const ct = await crypto.subtle.encrypt({name:"AES-GCM", iv: iv}, key, te.encode(JSON.stringify(obj)));
+  return {v:2, salt: b64enc(saltBytes), iv: b64enc(iv), data: b64enc(ct)};
 }
-async function decObj(pack, key){
-  const pt = await crypto.subtle.decrypt({name:"AES-GCM", iv: b64dec(pack.iv)}, key || cryptoKey, b64dec(pack.data));
+async function decryptWith(pack, pw){
+  const key = await deriveKey(pw, b64dec(pack.salt));
+  const pt = await crypto.subtle.decrypt({name:"AES-GCM", iv: b64dec(pack.iv)}, key, b64dec(pack.data));
   return JSON.parse(td.decode(pt));
+}
+async function encObj(obj, pw){
+  pw = pw || sessionPw;
+  return encryptWith(obj, pw, rndBytes(16));
+}
+async function decObj(pack, pw){
+  pw = pw || sessionPw;
+  return decryptWith(pack, pw);
+}
+/* GitHub 模式：用输入的密码尝试解密 data.enc，成功即密码正确（跨设备通用） */
+async function verifyPassword(pw){
+  if(ghMode && dataEncExists){
+    try{
+      const enc = await ghReadFile(GH_F_DATA_ENC, false);
+      if(!enc) return false;
+      await decObj(JSON.parse(b64d(enc.content)), pw);
+      return true;
+    }catch(e){ return false; }
+  }
+  return false;
 }
 
 /* ---------- 服务器自动保存（部署后录入永久保存到服务器） ---------- */
@@ -348,7 +372,7 @@ async function loadEncData(){
   if(plain){
     const obj = JSON.parse(b64d(plain.content));
     DATA = obj.items || []; META = obj.meta || {file_counts:{}, unique:0, total:0};
-    if(gh.token && cryptoKey){
+    if(gh.token && sessionPw){
       try{ await ghWriteFile(GH_F_DATA_ENC, JSON.stringify(await encObj(obj)), null); await ghDeleteFile(GH_F_DATA, plain.sha); }catch(e){}
     }
     return true;
@@ -359,33 +383,36 @@ async function loadEncData(){
 async function loadUserGH(){
   if(!ghMode || !gh || !gh.repo) return;
   const localUser = USER.slice();
+  let cloudUser = null;
   try{
     const enc = await ghReadFile(GH_F_ENTRIES_ENC, false);
     if(enc){
-      const arr = await decObj(JSON.parse(b64d(enc.content)));
-      USER = Array.isArray(arr) ? arr : [];
-    }else{
-      const plain = await ghReadFile(GH_F_ENTRIES, false);
-      if(plain){
-        try{ USER = JSON.parse(b64d(plain.content)) || []; }catch(e){ USER = []; }
-        if(gh.token && cryptoKey){
-          try{ await ghWriteFile(GH_F_ENTRIES_ENC, JSON.stringify(await encObj(USER)), null); await ghDeleteFile(GH_F_ENTRIES, plain.sha); }catch(e){}
-        }
-      }
+      try{ const arr = await decObj(JSON.parse(b64d(enc.content))); if(Array.isArray(arr)) cloudUser = arr; }catch(e){}
     }
   }catch(e){}
+  if(cloudUser){
+    USER = cloudUser;
+  }else{
+    const plain = await ghReadFile(GH_F_ENTRIES, false);
+    if(plain){
+      try{ USER = JSON.parse(b64d(plain.content)) || []; }catch(e){ USER = []; }
+      if(gh.token && sessionPw){
+        try{ await ghWriteFile(GH_F_ENTRIES_ENC, JSON.stringify(await encObj(USER)), null); await ghDeleteFile(GH_F_ENTRIES, plain.sha); }catch(e){}
+      }
+    }else if(!enc){ USER = []; }
+  }
   const cloudSet = new Set(USER.map(d => d.t));
   const localOnly = localUser.filter(u => !cloudSet.has(u.t));
   if(localOnly.length){
     USER = USER.concat(localOnly);
-    if(gh.token && cryptoKey){ try{ await pushUser(); }catch(e){} }
+    if(gh.token && sessionPw){ try{ await pushUser(); }catch(e){} }
   }
   saveUser();
 }
 async function pushUser(){
   if(!ghMode || !gh) return false;
   if(!gh.token){ toast("⚠️ 需要配置 Token 才能保存到 GitHub"); return false; }
-  if(!cryptoKey){ toast("⚠️ 加密密钥不可用，请退出后重新登录"); return false; }
+  if(!sessionPw){ toast("⚠️ 加密密钥不可用，请退出后重新登录"); return false; }
   try{
     const pack = await encObj(USER);
     const cur = await ghReadFile(GH_F_ENTRIES_ENC, true);
@@ -765,17 +792,25 @@ function ghEncrypted(){ return ghMode; }
 function lockShow(msg){ $("lock").style.display = "flex"; $("app").style.display = "none"; $("lockErr").textContent = msg || ""; }
 function lockHide(){ $("lock").style.display = "none"; $("app").style.display = "block"; }
 function lockSetupMode(){
-  hasPw = !!localStorage.getItem(PW_KEY);
-  $("lockTitle").textContent = hasPw ? "🔐 请输入访问密码" : "🔐 首次使用 · 设置访问密码";
-  $("lockSub").textContent = hasPw ? "灵感库已加密保护" : "设置后，灵感数据将以 AES-256 加密保存；GitHub 上的数据也会自动加密，明文文件会被删除";
-  if(!hasPw && ghMode && gh) $("lockSub").textContent = "已自动识别仓库 " + gh.repo + "。设置密码后即可加载数据（保存录入需在下方⚙️补填 Token）";
-  $("lockPw").placeholder = hasPw ? "访问密码" : "设置密码（至少 4 位）";
-  $("lockPw2").style.display = hasPw ? "none" : "block";
+  const setup = ghMode ? !dataEncExists : !localStorage.getItem(PW_KEY);
+  hasPw = !setup;
+  $("lockTitle").textContent = setup ? "🔐 设置访问密码" : "🔐 请输入访问密码";
+  if(setup){
+    $("lockSub").textContent = ghMode
+      ? "仓库数据尚未加密。设置密码后数据将转为密文（首次初始化需要 Token：下方⚙️）"
+      : "设置后，本页灵感数据将受密码保护";
+  }else{
+    $("lockSub").textContent = ghMode
+      ? "灵感库已加密保护 · 输入密码即可在任何设备解锁"
+      : "灵感库已加密保护";
+  }
+  $("lockPw").placeholder = setup ? "设置密码（至少 4 位）" : "访问密码";
+  $("lockPw2").style.display = setup ? "block" : "none";
   $("lockRememberLine").style.display = (hasPw && !ghEncrypted()) ? "flex" : "none";
-  $("lockBtn").textContent = hasPw ? "进入" : "设置密码并进入";
+  $("lockBtn").textContent = setup ? "设置密码并进入" : "进入";
   $("lockPw").value = ""; $("lockPw2").value = ""; $("lockErr").textContent = "";
   if(gh){ $("lockGhRepo").value = gh.repo || ""; $("lockGhBranch").value = gh.branch || "main"; $("lockGhToken").value = gh.token || ""; }
-  if(!RAW && ghMode && (!gh || !gh.token)){ try{ $("lockGh").open = true; }catch(e){} }
+  if(ghMode && (!gh || !gh.token)){ try{ $("lockGh").open = true; }catch(e){} }
   lockShow();
 }
 function syncGhInputs(){
@@ -786,13 +821,10 @@ function syncGhInputs(){
 function rememberValid(){
   try{ const s = JSON.parse(localStorage.getItem(SES_KEY) || "null"); return !!(s && s.exp && s.exp > Date.now()); }catch(e){ return false; }
 }
-async function tryUnlock(pw){
-  const stored = JSON.parse(localStorage.getItem(PW_KEY));
+async function tryUnlockLocal(pw){
+  const stored = JSON.parse(localStorage.getItem(PW_KEY) || "null");
   if(!stored) return false;
-  if((await pwHash(pw)) !== stored.hash) return false;
-  cryptoKey = await deriveKey(pw, b64dec(stored.salt));
-  sessionStorage.setItem(SES_KEY, "1");
-  return true;
+  return (await pwHash(pw)) === stored.hash;
 }
 async function loadAllData(){
   if(RAW){ DATA = RAW.items; META = RAW.meta; }
@@ -802,90 +834,127 @@ async function loadAllData(){
   else if(ghMode){ await loadUserGH(); }
   return true;
 }
+function renderStats(){
+  const unique = META.unique || 0;
+  const catN = CATS.map(c => c + " " + DATA.filter(d=>d.c===c).length + " 条").join(" · ");
+  $("subtitle").innerHTML = "四大类灵感汇总 · 共 <b>" + unique + "</b> 条（去重，累计 <b>" + (META.total||0) + "</b> 条记录）<br>" + esc(catN) + '<span class="userstat" id="userStat"></span><span class="modebadge" id="modeBadge"></span>';
+  const parts = Object.entries(META.file_counts || {}).map(([k,v]) => "<b>" + esc(k) + "</b>：" + v + " 条").join("　");
+  $("footer").innerHTML = "📚 数据来源（4 个华为备忘录导出文件，已合并去重）：" + parts +
+    "<br>🔖 大类：科学灵感 / 发明灵感 / 科普创作灵感 / 魔术灵感；每个大类下按子标签细分。" +
+    "<br>🔐 加密：本页数据以 AES-256 加密保护；GitHub 部署时灵感数据与录入均为密文存储（查看源码也看不到内容），密码只在你的浏览器本地校验。" +
+    "<br>☁️ 两种持久化方案：① 服务器模式——部署到服务器并运行 python3 server.py，录入实时写入服务器；② GitHub 云同步——在 GitHub 面板配置仓库与 Token 后，录入自动加密提交回仓库的 linggan-entries.enc，换设备、下次访问都还在；都未配置时降级为浏览器本地保存。" +
+    "<br>🖱️ 浏览：输入关键词实时搜索（支持标签名和来源名）→ 点大类/子标签/来源筛选组合 → 卡片实时更新；“复制当前结果”可导出筛选后的清单。" +
+    "<br>🕐 生成时间：2026-08-16（数据整理自 DSH 文件夹内 4 个 docx 文件）。";
+}
 $("lockBtn").onclick = async () => {
   const pw = $("lockPw").value;
-  if(hasPw){
+  const setup = ghMode ? !dataEncExists : !localStorage.getItem(PW_KEY);
+  if(!setup){
     /* —— 登录 —— */
     if(!pw){ $("lockErr").textContent = "请输入密码"; return; }
-    if(!(await tryUnlock(pw))){ $("lockErr").textContent = "❌ 密码错误"; return; }
-    if($("lockRemember").checked) localStorage.setItem(SES_KEY, JSON.stringify({exp: Date.now() + 30*864e5}));
+    if(ghMode){
+      if(!(await verifyPassword(pw))){ $("lockErr").textContent = "❌ 密码错误"; return; }
+    }else{
+      if(!(await tryUnlockLocal(pw))){ $("lockErr").textContent = "❌ 密码错误"; return; }
+    }
+    sessionPw = pw;
+    if(!ghMode && $("lockRemember").checked) localStorage.setItem(SES_KEY, JSON.stringify({exp: Date.now() + 30*864e5}));
     else localStorage.removeItem(SES_KEY);
     if(!(await loadAllData())){
-      sessionStorage.removeItem(SES_KEY); cryptoKey = null;
-      $("lockErr").textContent = "⚠️ 数据加载失败：" + (ghMode ? "仓库中未找到 data.json / data.enc，请检查下方⚙️的仓库名与分支" : "线上部署版需要配置 GitHub（下方⚙️）");
+      sessionStorage.removeItem(SES_KEY); sessionPw = null;
+      $("lockErr").textContent = "⚠️ 数据加载失败，请检查网络或下方⚙️的 GitHub 配置";
       try{ $("lockGh").open = true; }catch(e){}
       return;
     }
+    if(ghMode){ localStorage.setItem(PW_KEY, JSON.stringify({salt: "", hash: await pwHash(pw)})); }
     if(ghMode && !gh.token) setTimeout(()=>toast("💡 未配置 Token：当前只读；保存录入请在 GitHub 面板补填 Token"), 900);
-    lockHide();
-    renderEntryChips(); renderAll(); updateModeBadge();
+    lockHide(); renderStats(); renderEntryChips(); renderAll(); updateModeBadge();
     toast("✅ 已解锁，欢迎回来");
   }else{
-    /* —— 首次设置密码（数据加载成功后才保存密码） —— */
+    /* —— 设置密码 —— */
     const pw2 = $("lockPw2").value;
     if(pw.length < 4){ $("lockErr").textContent = "密码至少 4 位"; return; }
     if(pw !== pw2){ $("lockErr").textContent = "两次输入不一致"; return; }
     if(!hasSubtle){ $("lockErr").textContent = "当前环境不支持加密（需 https 或 localhost 访问）"; return; }
-    if(!RAW && !ghMode){ $("lockErr").textContent = "⚠️ 线上部署版需要先配置 GitHub（下方⚙️已展开）"; try{ $("lockGh").open = true; }catch(e){} return; }
-    const salt = rndBytes(16), hash = await pwHash(pw);
-    const key = await deriveKey(pw, salt);
-    cryptoKey = key;
+    if(ghMode){
+      if(!gh.token){ $("lockErr").textContent = "⚠️ 首次初始化需要 Token（所有者操作）：请在下方⚙️填写并保存后重试"; try{ $("lockGh").open = true; }catch(e){} return; }
+      if(!(await loadEncData())){
+        $("lockErr").textContent = "⚠️ 仓库中未找到 data.json（初始化数据源缺失），请联系 AI 助手恢复";
+        return;
+      }
+      try{
+        const salt = rndBytes(16);
+        const pack = await encryptWith({meta: META, items: DATA}, pw, salt);
+        await ghWriteFile(GH_F_DATA_ENC, JSON.stringify(pack), null);
+        const p = await ghReadFile(GH_F_DATA, true);
+        if(p) await ghDeleteFile(GH_F_DATA, p.sha);
+        dataEncExists = true;
+        localStorage.setItem(PW_KEY, JSON.stringify({salt: b64enc(salt), hash: await pwHash(pw)}));
+      }catch(e){
+        $("lockErr").textContent = "⚠️ 加密迁移失败：" + e.message;
+        return;
+      }
+    }else{
+      const salt = rndBytes(16), hash = await pwHash(pw);
+      localStorage.setItem(PW_KEY, JSON.stringify({salt: b64enc(salt), hash: hash}));
+    }
+    sessionPw = pw;
     sessionStorage.setItem(SES_KEY, "1");
     if(!(await loadAllData())){
-      cryptoKey = null;
-      sessionStorage.removeItem(SES_KEY);
-      $("lockErr").textContent = "⚠️ 未能加载灵感数据：" + (ghMode ? "仓库中未找到 data.json / data.enc，请检查仓库名与分支（下方⚙️）" : "请重新下载完整版文件（含数据的本地版）");
-      try{ $("lockGh").open = true; }catch(e){}
+      sessionStorage.removeItem(SES_KEY); sessionPw = null;
+      $("lockErr").textContent = "⚠️ 未能加载灵感数据，请重试";
       return;
     }
-    localStorage.setItem(PW_KEY, JSON.stringify({salt: b64enc(salt), hash: hash}));
-    hasPw = true;
-    if(ghMode && !gh.token) setTimeout(()=>toast("💡 未配置 Token：当前只读；保存录入请在 GitHub 面板补填 Token"), 900);
-    lockHide();
-    renderEntryChips(); renderAll(); updateModeBadge();
+    lockHide(); renderStats(); renderEntryChips(); renderAll(); updateModeBadge();
     toast("✅ 密码已设置，欢迎使用");
   }
 };
-$("lockGhSave").onclick = () => {
+$("lockGhSave").onclick = async () => {
   const repo = $("lockGhRepo").value.trim(), branch = $("lockGhBranch").value.trim() || "main", token = $("lockGhToken").value.trim();
   if(!repo){ $("lockErr").textContent = "请填写 GitHub 仓库名"; return; }
   gh = { repo: repo, branch: branch, token: token || "" };
   localStorage.setItem(GH_KEY, JSON.stringify(gh));
   ghMode = true;
   syncGhInputs();
+  try{ dataEncExists = !!(await ghReadFile(GH_F_DATA_ENC, false)); }catch(e){ dataEncExists = false; }
   $("lockErr").textContent = "✅ GitHub 配置已保存" + (token ? "" : "（未填 Token：可浏览，保存录入需补 Token）");
+  lockSetupMode();
 };
 $("pwChangeBtn").onclick = async () => {
   const oldPw = prompt("请输入当前密码：");
   if(!oldPw) return;
-  const stored = JSON.parse(localStorage.getItem(PW_KEY) || "null");
-  if(!stored || (await pwHash(oldPw)) !== stored.hash){ toast("当前密码不正确"); return; }
+  if(ghMode){
+    if(!(await verifyPassword(oldPw))){ toast("当前密码不正确"); return; }
+  }else{
+    if(!(await tryUnlockLocal(oldPw))){ toast("当前密码不正确"); return; }
+  }
   const np = prompt("请输入新密码（至少 4 位）：");
   if(!np || np.length < 4){ toast("新密码太短"); return; }
   if(prompt("请再次输入新密码：") !== np){ toast("两次输入不一致"); return; }
   if(ghMode && !gh.token){ toast("⚠️ 需先配置 Token 才能修改密码（要重新加密云端数据）"); return; }
-  const salt = rndBytes(16), hash = await pwHash(np);
-  const newKey = await deriveKey(np, salt);
   if(ghMode){
     try{
-      if(!RAW){
-        const cur = await ghReadFile(GH_F_DATA_ENC, true);
-        await ghWriteFile(GH_F_DATA_ENC, JSON.stringify(await encObj({meta: META, items: DATA}, newKey)), cur ? cur.sha : null);
-      }
+      const salt = rndBytes(16);
+      const pack = await encryptWith({meta: META, items: DATA}, np, salt);
+      const cur = await ghReadFile(GH_F_DATA_ENC, true);
+      await ghWriteFile(GH_F_DATA_ENC, JSON.stringify(pack), cur ? cur.sha : null);
       if(USER.length){
         const cur2 = await ghReadFile(GH_F_ENTRIES_ENC, true);
-        await ghWriteFile(GH_F_ENTRIES_ENC, JSON.stringify(await encObj(USER, newKey)), cur2 ? cur2.sha : null);
+        await ghWriteFile(GH_F_ENTRIES_ENC, JSON.stringify(await encObj(USER, np)), cur2 ? cur2.sha : null);
       }
+      localStorage.setItem(PW_KEY, JSON.stringify({salt: b64enc(salt), hash: await pwHash(np)}));
+      sessionPw = np;
     }catch(e){ toast("⚠️ 重新加密云端数据失败：" + e.message); return; }
+  }else{
+    const salt = rndBytes(16), hash = await pwHash(np);
+    localStorage.setItem(PW_KEY, JSON.stringify({salt: b64enc(salt), hash: hash}));
   }
-  localStorage.setItem(PW_KEY, JSON.stringify({salt: b64enc(salt), hash: hash}));
-  cryptoKey = newKey;
   toast("✅ 密码已修改" + (ghMode ? "，云端数据已用新密码重新加密" : ""));
 };
 $("logoutBtn").onclick = () => {
   sessionStorage.removeItem(SES_KEY);
   localStorage.removeItem(SES_KEY);
-  cryptoKey = null;
+  sessionPw = null;
   lockSetupMode();
 };
 
@@ -906,27 +975,15 @@ $("logoutBtn").onclick = () => {
     }catch(e){}
   }
   if(!serverMode && gh && gh.repo) ghMode = true;
-  const unique = META.unique || 0;
-  const catN = CATS.map(c => c + " " + DATA.filter(d=>d.c===c).length + " 条").join(" · ");
-  $("subtitle").innerHTML = "四大类灵感汇总 · 共 <b>" + unique + "</b> 条（去重，累计 <b>" + (META.total||0) + "</b> 条记录）<br>" + esc(catN) + '<span class="userstat" id="userStat"></span><span class="modebadge" id="modeBadge"></span>';
-  const parts = Object.entries(META.file_counts || {}).map(([k,v]) => "<b>" + esc(k) + "</b>：" + v + " 条").join("　");
-  $("footer").innerHTML = "📚 数据来源（4 个华为备忘录导出文件，已合并去重）：" + parts +
-    "<br>🔖 大类：科学灵感 / 发明灵感 / 科普创作灵感 / 魔术灵感；每个大类下按子标签细分。" +
-    "<br>🔐 加密：本页数据以 AES-256 加密保护；GitHub 部署时灵感数据与录入均为密文存储（查看源码也看不到内容），密码只在你的浏览器本地校验。" +
-    "<br>☁️ 两种持久化方案：① 服务器模式——部署到服务器并运行 python3 server.py，录入实时写入服务器；② GitHub 云同步——在 GitHub 面板配置仓库与 Token 后，录入自动加密提交回仓库的 linggan-entries.enc，换设备、下次访问都还在；都未配置时降级为浏览器本地保存。" +
-    "<br>🖱️ 浏览：输入关键词实时搜索（支持标签名和来源名）→ 点大类/子标签/来源筛选组合 → 卡片实时更新；“复制当前结果”可导出筛选后的清单。" +
-    "<br>🕐 生成时间：2026-08-16（数据整理自 DSH 文件夹内 4 个 docx 文件）。";
+  if(ghMode){ try{ dataEncExists = !!(await ghReadFile(GH_F_DATA_ENC, false)); }catch(e){ dataEncExists = false; } }
+  renderStats();
   $("newBatch").value = todayStr() + " 手动录入";
   syncGhInputs();
-  if(!hasPw){ lockSetupMode(); return; }
+  if(ghMode){ lockSetupMode(); return; }              // GitHub 模式：始终锁屏（解密需密码）
+  if(!localStorage.getItem(PW_KEY)){ lockSetupMode(); return; }
   const sess = sessionStorage.getItem(SES_KEY) === "1";
-  if(ghEncrypted()){
-    if(sess){ lockHide(); if(await loadAllData()){ renderEntryChips(); renderAll(); updateModeBadge(); } else { lockSetupMode(); } }
-    else lockSetupMode();
-  }else{
-    if(sess || rememberValid()){ lockHide(); renderEntryChips(); renderAll(); updateModeBadge(); }
-    else lockSetupMode();
-  }
+  if(sess || rememberValid()){ lockHide(); renderStats(); renderEntryChips(); renderAll(); updateModeBadge(); }
+  else lockSetupMode();
 })();
 </script>
 </body>
