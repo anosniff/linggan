@@ -126,7 +126,7 @@ footer b{color:#475569}
     <label class="checkline lock-remember" id="lockRememberLine" style="display:none"><input type="checkbox" id="lockRemember"> 记住我（30 天）</label>
     <button class="btn primary lock-btn" id="lockBtn">进入</button>
     <div class="lock-err" id="lockErr"></div>
-    <details class="lock-gh">
+    <details class="lock-gh" id="lockGh">
       <summary>⚙️ GitHub 配置（部署在 GitHub Pages 上时需要）</summary>
       <input id="lockGhRepo" class="lg-input" placeholder="用户名/仓库名，如 anosniff/linggan">
       <input id="lockGhBranch" class="lg-input" value="main" placeholder="分支 main">
@@ -768,12 +768,14 @@ function lockSetupMode(){
   hasPw = !!localStorage.getItem(PW_KEY);
   $("lockTitle").textContent = hasPw ? "🔐 请输入访问密码" : "🔐 首次使用 · 设置访问密码";
   $("lockSub").textContent = hasPw ? "灵感库已加密保护" : "设置后，灵感数据将以 AES-256 加密保存；GitHub 上的数据也会自动加密，明文文件会被删除";
+  if(!hasPw && ghMode && gh) $("lockSub").textContent = "已自动识别仓库 " + gh.repo + "。设置密码后即可加载数据（保存录入需在下方⚙️补填 Token）";
   $("lockPw").placeholder = hasPw ? "访问密码" : "设置密码（至少 4 位）";
   $("lockPw2").style.display = hasPw ? "none" : "block";
   $("lockRememberLine").style.display = (hasPw && !ghEncrypted()) ? "flex" : "none";
   $("lockBtn").textContent = hasPw ? "进入" : "设置密码并进入";
   $("lockPw").value = ""; $("lockPw2").value = ""; $("lockErr").textContent = "";
   if(gh){ $("lockGhRepo").value = gh.repo || ""; $("lockGhBranch").value = gh.branch || "main"; $("lockGhToken").value = gh.token || ""; }
+  if(!RAW && ghMode && (!gh || !gh.token)){ try{ $("lockGh").open = true; }catch(e){} }
   lockShow();
 }
 function syncGhInputs(){
@@ -803,29 +805,46 @@ async function loadAllData(){
 $("lockBtn").onclick = async () => {
   const pw = $("lockPw").value;
   if(hasPw){
+    /* —— 登录 —— */
     if(!pw){ $("lockErr").textContent = "请输入密码"; return; }
     if(!(await tryUnlock(pw))){ $("lockErr").textContent = "❌ 密码错误"; return; }
     if($("lockRemember").checked) localStorage.setItem(SES_KEY, JSON.stringify({exp: Date.now() + 30*864e5}));
     else localStorage.removeItem(SES_KEY);
+    if(!(await loadAllData())){
+      sessionStorage.removeItem(SES_KEY); cryptoKey = null;
+      $("lockErr").textContent = "⚠️ 数据加载失败：" + (ghMode ? "仓库中未找到 data.json / data.enc，请检查下方⚙️的仓库名与分支" : "线上部署版需要配置 GitHub（下方⚙️）");
+      try{ $("lockGh").open = true; }catch(e){}
+      return;
+    }
+    if(ghMode && !gh.token) setTimeout(()=>toast("💡 未配置 Token：当前只读；保存录入请在 GitHub 面板补填 Token"), 900);
+    lockHide();
+    renderEntryChips(); renderAll(); updateModeBadge();
+    toast("✅ 已解锁，欢迎回来");
   }else{
+    /* —— 首次设置密码（数据加载成功后才保存密码） —— */
     const pw2 = $("lockPw2").value;
     if(pw.length < 4){ $("lockErr").textContent = "密码至少 4 位"; return; }
     if(pw !== pw2){ $("lockErr").textContent = "两次输入不一致"; return; }
     if(!hasSubtle){ $("lockErr").textContent = "当前环境不支持加密（需 https 或 localhost 访问）"; return; }
+    if(!RAW && !ghMode){ $("lockErr").textContent = "⚠️ 线上部署版需要先配置 GitHub（下方⚙️已展开）"; try{ $("lockGh").open = true; }catch(e){} return; }
     const salt = rndBytes(16), hash = await pwHash(pw);
+    const key = await deriveKey(pw, salt);
+    cryptoKey = key;
+    sessionStorage.setItem(SES_KEY, "1");
+    if(!(await loadAllData())){
+      cryptoKey = null;
+      sessionStorage.removeItem(SES_KEY);
+      $("lockErr").textContent = "⚠️ 未能加载灵感数据：" + (ghMode ? "仓库中未找到 data.json / data.enc，请检查仓库名与分支（下方⚙️）" : "请重新下载完整版文件（含数据的本地版）");
+      try{ $("lockGh").open = true; }catch(e){}
+      return;
+    }
     localStorage.setItem(PW_KEY, JSON.stringify({salt: b64enc(salt), hash: hash}));
     hasPw = true;
-    cryptoKey = await deriveKey(pw, salt);
-    sessionStorage.setItem(SES_KEY, "1");
+    if(ghMode && !gh.token) setTimeout(()=>toast("💡 未配置 Token：当前只读；保存录入请在 GitHub 面板补填 Token"), 900);
+    lockHide();
+    renderEntryChips(); renderAll(); updateModeBadge();
+    toast("✅ 密码已设置，欢迎使用");
   }
-  if(!(await loadAllData())){
-    sessionStorage.removeItem(SES_KEY);
-    $("lockErr").textContent = "⚠️ 未能加载灵感数据：" + (ghMode ? "请检查 GitHub 仓库名是否正确（仓库需有 data.json 或 data.enc）" : "本地数据缺失，请重新下载完整版文件");
-    return;
-  }
-  lockHide();
-  renderEntryChips(); renderAll(); updateModeBadge();
-  toast("✅ 已解锁，欢迎回来");
 };
 $("lockGhSave").onclick = () => {
   const repo = $("lockGhRepo").value.trim(), branch = $("lockGhBranch").value.trim() || "main", token = $("lockGhToken").value.trim();
@@ -873,6 +892,19 @@ $("logoutBtn").onclick = () => {
 /* ---------- 启动 ---------- */
 (async function boot(){
   try{ await connectServer(); }catch(e){ serverMode = false; }
+  // 部署在 GitHub Pages 时自动识别仓库（用户名/仓库名），免去手动配置
+  if(!gh || !gh.repo){
+    try{
+      if(typeof location !== "undefined"){
+        const host = location.hostname || "";
+        const m = host.match(/^([^.]+)\.github\.io$/);
+        if(m && (location.pathname.split("/")[1] || "")){
+          gh = { repo: m[1] + "/" + location.pathname.split("/")[1], branch: "main", token: "" };
+          localStorage.setItem(GH_KEY, JSON.stringify(gh));
+        }
+      }
+    }catch(e){}
+  }
   if(!serverMode && gh && gh.repo) ghMode = true;
   const unique = META.unique || 0;
   const catN = CATS.map(c => c + " " + DATA.filter(d=>d.c===c).length + " 条").join(" · ");
